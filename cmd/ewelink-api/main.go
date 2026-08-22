@@ -49,7 +49,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	service := bridge.NewServiceWithCache(bridge.NewMCPClient(mcpURL, nil), cache, metrics, logger)
 
-	if err := service.Refresh(ctx); err != nil {
+	if err := service.RefreshIfStale(ctx, refreshInterval); err != nil {
 		log.Fatalf("initial device refresh failed: %v", err)
 	}
 	go service.RefreshLoop(ctx, refreshInterval)

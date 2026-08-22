@@ -28,16 +28,10 @@ func NewHTTPHandler(service *Service) http.Handler {
 		writeJSON(w, status, response)
 	})
 	mux.HandleFunc("POST /v1/update", func(w http.ResponseWriter, r *http.Request) {
-		if err := service.Refresh(r.Context()); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		snapshot, err := service.Snapshot(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, snapshot)
+		handleForcedRefresh(w, r, service)
+	})
+	mux.HandleFunc("GET /v1/devices/force", func(w http.ResponseWriter, r *http.Request) {
+		handleForcedRefresh(w, r, service)
 	})
 	mux.HandleFunc("GET /v1/devices", func(w http.ResponseWriter, r *http.Request) {
 		snapshot, err := service.Snapshot(r.Context())
@@ -67,6 +61,19 @@ func NewHTTPHandler(service *Service) http.Handler {
 		handleSwitch(w, r, service, r.PostForm.Get("state"))
 	})
 	return mux
+}
+
+func handleForcedRefresh(w http.ResponseWriter, r *http.Request, service *Service) {
+	if err := service.Refresh(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	snapshot, err := service.Snapshot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func handleSwitch(w http.ResponseWriter, r *http.Request, service *Service, state string) {

@@ -35,12 +35,14 @@ type Cache interface {
 	Snapshot(context.Context) (Snapshot, error)
 	Get(context.Context, string) (Device, bool, error)
 	SetSwitch(context.Context, string, string) error
+	TryAcquireRefreshLease(context.Context, time.Duration) (bool, error)
 	Close() error
 }
 
 type memoryCache struct {
-	mu       sync.RWMutex
-	snapshot Snapshot
+	mu                sync.RWMutex
+	snapshot          Snapshot
+	refreshLeaseUntil time.Time
 }
 
 func NewMemoryCache() Cache {
@@ -98,6 +100,17 @@ func (c *memoryCache) SetSwitch(_ context.Context, id, state string) error {
 	return fmt.Errorf("device %q is not in the cache", id)
 }
 
+func (c *memoryCache) TryAcquireRefreshLease(_ context.Context, duration time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if now.Before(c.refreshLeaseUntil) {
+		return false, nil
+	}
+	c.refreshLeaseUntil = now.Add(duration)
+	return true, nil
+}
+
 func (c *memoryCache) Close() error { return nil }
 
 type RedisOptions struct {
@@ -112,7 +125,10 @@ type redisCache struct {
 	key    string
 }
 
-const redisSnapshotKey = "ewelink-api:device-snapshot"
+const (
+	redisSnapshotKey     = "ewelink-api:device-snapshot"
+	redisRefreshLeaseKey = "ewelink-api:device-refresh-lease"
+)
 
 func NewRedisCache(ctx context.Context, options RedisOptions) (Cache, error) {
 	client := redis.NewClient(&redis.Options{
@@ -169,6 +185,14 @@ func (c *redisCache) SetSwitch(ctx context.Context, id, state string) error {
 		}
 		return fmt.Errorf("device %q is not in the cache", id)
 	})
+}
+
+func (c *redisCache) TryAcquireRefreshLease(ctx context.Context, duration time.Duration) (bool, error) {
+	acquired, err := c.client.SetNX(ctx, redisRefreshLeaseKey, "1", duration).Result()
+	if err != nil {
+		return false, fmt.Errorf("acquire Redis refresh lease: %w", err)
+	}
+	return acquired, nil
 }
 
 func (c *redisCache) Close() error { return c.client.Close() }

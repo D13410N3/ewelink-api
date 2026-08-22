@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestUpdateEndpointRefreshesSnapshot(t *testing.T) {
+func TestForcedRefreshEndpointsUpdateSnapshot(t *testing.T) {
 	remote := &fakeRemote{devices: []Device{{ID: "one", Params: map[string]any{"switch": "off"}}}}
 	service := newTestService(remote)
 	if err := service.Refresh(context.Background()); err != nil {
@@ -26,13 +26,23 @@ func TestUpdateEndpointRefreshesSnapshot(t *testing.T) {
 		t.Fatalf("updated cache does not contain new device: found=%t, error=%v", found, err)
 	}
 
+	remote.devices = []Device{{ID: "three", Params: map[string]any{"switch": "off"}}}
+	forceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(forceResponse, httptest.NewRequest(http.MethodGet, "/v1/devices/force", nil))
+	if forceResponse.Code != http.StatusOK {
+		t.Fatalf("force status = %d, want %d: %s", forceResponse.Code, http.StatusOK, forceResponse.Body.String())
+	}
+	if _, found, err := service.Device(context.Background(), "three"); err != nil || !found {
+		t.Fatalf("force endpoint did not update cache: found=%t, error=%v", found, err)
+	}
+
 	remote.fetchErr = errHealthRefresh
 	failedResponse := httptest.NewRecorder()
-	handler.ServeHTTP(failedResponse, httptest.NewRequest(http.MethodPost, "/v1/update", nil))
+	handler.ServeHTTP(failedResponse, httptest.NewRequest(http.MethodGet, "/v1/devices/force", nil))
 	if failedResponse.Code != http.StatusBadGateway {
 		t.Fatalf("failed update status = %d, want %d", failedResponse.Code, http.StatusBadGateway)
 	}
-	if _, found, err := service.Device(context.Background(), "two"); err != nil || !found {
+	if _, found, err := service.Device(context.Background(), "three"); err != nil || !found {
 		t.Fatalf("failed update did not retain cache: found=%t, error=%v", found, err)
 	}
 }

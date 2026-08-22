@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 type fakeRemote struct {
@@ -14,9 +15,11 @@ type fakeRemote struct {
 	controlErr   error
 	controlledID string
 	controlledTo string
+	fetches      int
 }
 
 func (f *fakeRemote) FetchDevices(context.Context) ([]Device, error) {
+	f.fetches++
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
 	}
@@ -31,6 +34,52 @@ func (f *fakeRemote) ControlSwitch(_ context.Context, device Device, state strin
 
 func newTestService(remote Remote) *Service {
 	return NewService(remote, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestRefreshIfStaleUsesSharedFreshSnapshot(t *testing.T) {
+	cache := NewMemoryCache()
+	if err := cache.Replace(context.Background(), []Device{{ID: "existing"}}, time.Now().UTC()); err != nil {
+		t.Fatalf("cache.Replace() error = %v", err)
+	}
+	remote := &fakeRemote{devices: []Device{{ID: "from-remote"}}}
+	service := NewServiceWithCache(remote, cache, noopMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := service.RefreshIfStale(context.Background(), time.Minute); err != nil {
+		t.Fatalf("RefreshIfStale() error = %v", err)
+	}
+	device, found, err := service.Device(context.Background(), "existing")
+	if err != nil || !found || device.ID != "existing" {
+		t.Fatalf("fresh shared snapshot changed unexpectedly: device=%#v found=%t error=%v", device, found, err)
+	}
+	if remote.fetches != 0 {
+		t.Fatalf("remote fetches = %d, want 0 for a fresh shared snapshot", remote.fetches)
+	}
+}
+
+func TestRefreshIfStaleRefreshesSharedStaleSnapshotOnce(t *testing.T) {
+	cache := NewMemoryCache()
+	if err := cache.Replace(context.Background(), []Device{{ID: "stale"}}, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("cache.Replace() error = %v", err)
+	}
+	remote := &fakeRemote{devices: []Device{{ID: "fresh"}}}
+	first := NewServiceWithCache(remote, cache, noopMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	second := NewServiceWithCache(remote, cache, noopMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := first.RefreshIfStale(context.Background(), time.Second); err != nil {
+		t.Fatalf("first RefreshIfStale() error = %v", err)
+	}
+	if err := second.RefreshIfStale(context.Background(), time.Second); err != nil {
+		t.Fatalf("second RefreshIfStale() error = %v", err)
+	}
+	if _, found, _ := second.Device(context.Background(), "fresh"); !found {
+		t.Fatal("shared stale snapshot was not refreshed")
+	}
+	if _, found, _ := second.Device(context.Background(), "stale"); found {
+		t.Fatal("stale shared snapshot was not replaced")
+	}
+	if remote.fetches != 1 {
+		t.Fatalf("remote fetches = %d, want 1 for shared stale snapshot", remote.fetches)
+	}
 }
 
 func TestSwitchUpdatesCacheUntilAuthoritativeRefresh(t *testing.T) {

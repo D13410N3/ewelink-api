@@ -19,7 +19,7 @@ export CACHE_MODE='memory'                  # memory (default) or redis
 go run ./cmd/ewelink-api
 ```
 
-`CACHE_MODE=redis` shares the snapshot between bridge instances. Redis settings are optional and default to `127.0.0.1:6379`, database `0`, with no authentication:
+`CACHE_MODE=redis` shares the snapshot between bridge instances. Scheduled and startup refreshes check the shared `refreshedAt` timestamp first; an atomic short Redis lease ensures that only one replica fetches eWeLink when the snapshot is stale. Other replicas continue serving the shared snapshot, so eWeLink is polled at most once per `REFRESH_INTERVAL`. This is a per-refresh reservation, not a long-lived leader-election role. With `CACHE_MODE=memory`, each replica has its own cache and polls independently. Redis settings are optional and default to `127.0.0.1:6379`, database `0`, with no authentication:
 
 ```sh
 export CACHE_MODE='redis'
@@ -40,7 +40,8 @@ All application responses are JSON.
 | `GET` | `/health-check` | Refresh health; `200` after the last refresh succeeded, otherwise `503` |
 | `GET` | `/metrics` | Prometheus/OpenMetrics metrics, including standard Go/process metrics |
 | `GET` | `/v1/devices` | Cached devices and snapshot metadata |
-| `POST` | `/v1/update` | Force a device-list refresh from eWeLink and return the new snapshot |
+| `POST` | `/v1/update` | Force a device-list refresh from eWeLink and return the new snapshot (bypasses the scheduled refresh interval) |
+| `GET` | `/v1/devices/force` | Force a fresh device list from eWeLink, update cache, and return the new snapshot |
 | `GET` | `/v1/devices/{deviceID}` | A single cached device |
 | `POST` | `/v1/devices/{deviceID}/switch` | Set or toggle its primary `switch` parameter |
 
@@ -55,6 +56,7 @@ curl http://localhost:8080/health-check
 curl http://localhost:8080/metrics
 curl http://localhost:8080/v1/devices
 curl -X POST http://localhost:8080/v1/update
+curl http://localhost:8080/v1/devices/force
 curl -X POST http://localhost:8080/v1/devices/1000abc/switch \
   -d 'state=on'
 curl -X POST http://localhost:8080/v1/devices/1000abc/switch
@@ -72,7 +74,7 @@ A healthy `GET /health-check` returns `200 OK`:
 }
 ```
 
-`GET /v1/devices` returns the cached authoritative snapshot. `POST /v1/update` forces a refresh from eWeLink and returns the same snapshot shape:
+`GET /v1/devices` returns the cached authoritative snapshot. `POST /v1/update` and `GET /v1/devices/force` force a refresh from eWeLink, update the configured cache, and return the same snapshot shape:
 
 ```json
 {

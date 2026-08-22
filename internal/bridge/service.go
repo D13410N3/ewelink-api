@@ -31,6 +31,8 @@ func NewServiceWithCache(remote Remote, cache Cache, metrics deviceMetrics, logg
 	return &Service{remote: remote, cache: cache, metrics: metrics, logger: logger}
 }
 
+// Refresh always fetches an authoritative device snapshot from eWeLink.
+// It is used by the explicit POST /v1/update endpoint.
 func (s *Service) Refresh(ctx context.Context) error {
 	devices, err := s.remote.FetchDevices(ctx)
 	if err != nil {
@@ -47,6 +49,41 @@ func (s *Service) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// RefreshIfStale uses the shared snapshot timestamp to avoid an eWeLink
+// request when another replica has refreshed Redis within the interval. When
+// a refresh is due, the cache lease lets exactly one replica make that request.
+func (s *Service) RefreshIfStale(ctx context.Context, interval time.Duration) error {
+	snapshot, err := s.cache.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.RefreshError == "" && !snapshot.RefreshedAt.IsZero() && time.Since(snapshot.RefreshedAt) < interval {
+		s.metrics.RecordRefresh(snapshot.Devices)
+		return nil
+	}
+
+	acquired, err := s.cache.TryAcquireRefreshLease(ctx, interval)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		s.metrics.RecordRefresh(snapshot.Devices)
+		return nil
+	}
+
+	// A different replica may have refreshed between the first read and lease
+	// acquisition. Re-read before making the remote request.
+	snapshot, err = s.cache.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.RefreshError == "" && !snapshot.RefreshedAt.IsZero() && time.Since(snapshot.RefreshedAt) < interval {
+		s.metrics.RecordRefresh(snapshot.Devices)
+		return nil
+	}
+	return s.Refresh(ctx)
+}
+
 func (s *Service) RefreshLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -55,7 +92,7 @@ func (s *Service) RefreshLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.Refresh(ctx); err != nil {
+			if err := s.RefreshIfStale(ctx, interval); err != nil {
 				s.logger.Error("eWeLink device refresh failed; retaining previous snapshot", "error", err)
 			}
 		}
