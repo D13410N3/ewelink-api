@@ -122,7 +122,7 @@ func (s *Service) Switch(ctx context.Context, id, state string) (Device, error) 
 	if err := s.remote.ControlSwitch(ctx, device, state); err != nil {
 		return Device{}, err
 	}
-	if err := s.cache.SetSwitch(ctx, id, state); err != nil {
+	if err := s.cache.SetSwitch(ctx, id, state, time.Now().UTC()); err != nil {
 		return Device{}, err
 	}
 	s.metrics.RecordSwitch(device, state)

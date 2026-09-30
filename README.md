@@ -86,12 +86,15 @@ A healthy `GET /health-check` returns `200 OK`:
       "uiid": "1",
       "params": {
         "switch": "off"
-      }
+      },
+      "lastStateChangeAt": "2026-08-22T10:15:30Z"
     }
   ],
   "refreshedAt": "2026-08-22T10:15:30Z"
 }
 ```
+
+`lastStateChangeAt` records the best-known time when the scalar switch state last changed. A successful service switch sets it immediately. On a later eWeLink refresh, it is retained while the reported state is unchanged; if eWeLink reports a different state (for example, after a physical/manual action), the refresh time becomes the new value. Rapid changes that begin and end between refreshes cannot be detected.
 
 A successful `POST /v1/devices/1000abc/switch` with `state=on` returns `200 OK` and the temporarily updated cached device:
 
@@ -103,7 +106,8 @@ A successful `POST /v1/devices/1000abc/switch` with `state=on` returns `200 OK` 
   "uiid": "1",
   "params": {
     "switch": "on"
-  }
+  },
+  "lastStateChangeAt": "2026-08-22T10:15:45Z"
 }
 ```
 

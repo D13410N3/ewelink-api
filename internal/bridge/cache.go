@@ -12,13 +12,14 @@ import (
 
 // Device is the device data the bridge needs to list and control a device.
 type Device struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Online   bool           `json:"online"`
-	UIID     string         `json:"uiid,omitempty"`
-	Params   map[string]any `json:"params"`
-	Family   any            `json:"family,omitempty"`
-	Channels any            `json:"channels,omitempty"`
+	ID                string         `json:"id"`
+	Name              string         `json:"name"`
+	Online            bool           `json:"online"`
+	UIID              string         `json:"uiid,omitempty"`
+	Params            map[string]any `json:"params"`
+	Family            any            `json:"family,omitempty"`
+	Channels          any            `json:"channels,omitempty"`
+	LastStateChangeAt *time.Time     `json:"lastStateChangeAt,omitempty"`
 }
 
 type Snapshot struct {
@@ -34,7 +35,7 @@ type Cache interface {
 	SetRefreshError(context.Context, error) error
 	Snapshot(context.Context) (Snapshot, error)
 	Get(context.Context, string) (Device, bool, error)
-	SetSwitch(context.Context, string, string) error
+	SetSwitch(context.Context, string, string, time.Time) error
 	TryAcquireRefreshLease(context.Context, time.Duration) (bool, error)
 	Close() error
 }
@@ -49,12 +50,15 @@ func NewMemoryCache() Cache {
 	return &memoryCache{snapshot: Snapshot{Devices: []Device{}}}
 }
 
-// Replace installs an authoritative MCP snapshot. It deliberately discards all
-// locally optimistic values created by controls between refreshes.
+// Replace installs an authoritative MCP snapshot. It preserves a device's
+// state-change timestamp when its scalar switch state has not changed.
 func (c *memoryCache) Replace(_ context.Context, devices []Device, refreshedAt time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.snapshot = Snapshot{Devices: cloneDevices(devices), RefreshedAt: refreshedAt}
+	c.snapshot = Snapshot{
+		Devices:     mergeDevices(c.snapshot.Devices, devices, refreshedAt),
+		RefreshedAt: refreshedAt,
+	}
 	return nil
 }
 
@@ -84,7 +88,7 @@ func (c *memoryCache) Get(_ context.Context, id string) (Device, bool, error) {
 
 // SetSwitch applies a successful control result locally. The next Replace
 // removes it in favor of the remote server's authoritative status.
-func (c *memoryCache) SetSwitch(_ context.Context, id, state string) error {
+func (c *memoryCache) SetSwitch(_ context.Context, id, state string, changedAt time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i := range c.snapshot.Devices {
@@ -95,6 +99,7 @@ func (c *memoryCache) SetSwitch(_ context.Context, id, state string) error {
 			c.snapshot.Devices[i].Params = make(map[string]any)
 		}
 		c.snapshot.Devices[i].Params["switch"] = state
+		c.snapshot.Devices[i].LastStateChangeAt = timePointer(changedAt)
 		return nil
 	}
 	return fmt.Errorf("device %q is not in the cache", id)
@@ -144,7 +149,12 @@ func NewRedisCache(ctx context.Context, options RedisOptions) (Cache, error) {
 }
 
 func (c *redisCache) Replace(ctx context.Context, devices []Device, refreshedAt time.Time) error {
-	return c.save(ctx, Snapshot{Devices: cloneDevices(devices), RefreshedAt: refreshedAt})
+	return c.mutate(ctx, func(snapshot *Snapshot) error {
+		snapshot.Devices = mergeDevices(snapshot.Devices, devices, refreshedAt)
+		snapshot.RefreshedAt = refreshedAt
+		snapshot.RefreshError = ""
+		return nil
+	})
 }
 
 func (c *redisCache) SetRefreshError(ctx context.Context, refreshErr error) error {
@@ -171,7 +181,7 @@ func (c *redisCache) Get(ctx context.Context, id string) (Device, bool, error) {
 	return Device{}, false, nil
 }
 
-func (c *redisCache) SetSwitch(ctx context.Context, id, state string) error {
+func (c *redisCache) SetSwitch(ctx context.Context, id, state string, changedAt time.Time) error {
 	return c.mutate(ctx, func(snapshot *Snapshot) error {
 		for i := range snapshot.Devices {
 			if snapshot.Devices[i].ID != id {
@@ -181,6 +191,7 @@ func (c *redisCache) SetSwitch(ctx context.Context, id, state string) error {
 				snapshot.Devices[i].Params = make(map[string]any)
 			}
 			snapshot.Devices[i].Params["switch"] = state
+			snapshot.Devices[i].LastStateChangeAt = timePointer(changedAt)
 			return nil
 		}
 		return fmt.Errorf("device %q is not in the cache", id)
@@ -253,6 +264,43 @@ func (c *redisCache) save(ctx context.Context, snapshot Snapshot) error {
 	return nil
 }
 
+func mergeDevices(previous, incoming []Device, refreshedAt time.Time) []Device {
+	previousByID := make(map[string]Device, len(previous))
+	for _, device := range previous {
+		previousByID[device.ID] = device
+	}
+
+	merged := cloneDevices(incoming)
+	for i := range merged {
+		previousDevice, found := previousByID[merged[i].ID]
+		state, hasState := scalarSwitchState(merged[i])
+		if !hasState {
+			if found && previousDevice.LastStateChangeAt != nil {
+				merged[i].LastStateChangeAt = timePointer(*previousDevice.LastStateChangeAt)
+			}
+			continue
+		}
+
+		previousState, previousHasState := scalarSwitchState(previousDevice)
+		if found && previousHasState && previousState == state && previousDevice.LastStateChangeAt != nil {
+			merged[i].LastStateChangeAt = timePointer(*previousDevice.LastStateChangeAt)
+			continue
+		}
+		merged[i].LastStateChangeAt = timePointer(refreshedAt)
+	}
+	return merged
+}
+
+func scalarSwitchState(device Device) (string, bool) {
+	state, ok := device.Params["switch"].(string)
+	return state, ok && (state == "on" || state == "off")
+}
+
+func timePointer(value time.Time) *time.Time {
+	value = value.UTC()
+	return &value
+}
+
 func cloneSnapshot(snapshot Snapshot) Snapshot {
 	clone := snapshot
 	clone.Devices = cloneDevices(snapshot.Devices)
@@ -269,6 +317,9 @@ func cloneDevices(devices []Device) []Device {
 
 func cloneDevice(device Device) Device {
 	clone := device
+	if device.LastStateChangeAt != nil {
+		clone.LastStateChangeAt = timePointer(*device.LastStateChangeAt)
+	}
 	if device.Params != nil {
 		clone.Params = make(map[string]any, len(device.Params))
 		for key, value := range device.Params {

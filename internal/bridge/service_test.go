@@ -82,6 +82,33 @@ func TestRefreshIfStaleRefreshesSharedStaleSnapshotOnce(t *testing.T) {
 	}
 }
 
+func TestRefreshPreservesTimestampUntilObservedStateChange(t *testing.T) {
+	cache := NewMemoryCache()
+	service := NewServiceWithCache(&fakeRemote{}, cache, noopMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	initialAt := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	if err := cache.Replace(context.Background(), []Device{{ID: "one", Params: map[string]any{"switch": "off"}}}, initialAt); err != nil {
+		t.Fatalf("initial Replace() error = %v", err)
+	}
+
+	unchangedRefreshAt := initialAt.Add(time.Minute)
+	if err := cache.Replace(context.Background(), []Device{{ID: "one", Params: map[string]any{"switch": "off"}}}, unchangedRefreshAt); err != nil {
+		t.Fatalf("unchanged Replace() error = %v", err)
+	}
+	device, found, err := service.Device(context.Background(), "one")
+	if err != nil || !found || device.LastStateChangeAt == nil || !device.LastStateChangeAt.Equal(initialAt) {
+		t.Fatalf("unchanged state timestamp = %v, found=%t, error=%v; want %v", device.LastStateChangeAt, found, err, initialAt)
+	}
+
+	changedRefreshAt := unchangedRefreshAt.Add(time.Minute)
+	if err := cache.Replace(context.Background(), []Device{{ID: "one", Params: map[string]any{"switch": "on"}}}, changedRefreshAt); err != nil {
+		t.Fatalf("changed Replace() error = %v", err)
+	}
+	device, found, err = service.Device(context.Background(), "one")
+	if err != nil || !found || device.LastStateChangeAt == nil || !device.LastStateChangeAt.Equal(changedRefreshAt) {
+		t.Fatalf("changed state timestamp = %v, found=%t, error=%v; want %v", device.LastStateChangeAt, found, err, changedRefreshAt)
+	}
+}
+
 func TestSwitchUpdatesCacheUntilAuthoritativeRefresh(t *testing.T) {
 	remote := &fakeRemote{devices: []Device{{ID: "one", Name: "Lamp", Params: map[string]any{"switch": "off"}}}}
 	service := newTestService(remote)
@@ -99,17 +126,33 @@ func TestSwitchUpdatesCacheUntilAuthoritativeRefresh(t *testing.T) {
 	if got := device.Params["switch"]; got != "on" {
 		t.Fatalf("local switch state = %v, want on", got)
 	}
+	if device.LastStateChangeAt == nil {
+		t.Fatal("local switch did not set lastStateChangeAt")
+	}
+	localChangeAt := *device.LastStateChangeAt
+
+	remote.devices[0].Params["switch"] = "on"
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	device, ok, err := service.Device(context.Background(), "one")
+	if err != nil || !ok || device.LastStateChangeAt == nil || !device.LastStateChangeAt.Equal(localChangeAt) {
+		t.Fatalf("unchanged refresh did not retain local timestamp: %#v, found=%t, error=%v", device, ok, err)
+	}
 
 	remote.devices[0].Params["switch"] = "off"
 	if err := service.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh() error = %v", err)
 	}
-	device, ok, err := service.Device(context.Background(), "one")
+	device, ok, err = service.Device(context.Background(), "one")
 	if err != nil {
 		t.Fatalf("Device() error = %v", err)
 	}
 	if !ok || device.Params["switch"] != "off" {
 		t.Fatalf("authoritative refresh did not replace local state: %#v", device)
+	}
+	if device.LastStateChangeAt == nil || !device.LastStateChangeAt.After(localChangeAt) {
+		t.Fatalf("changed refresh did not set a newer timestamp: %v, previous=%v", device.LastStateChangeAt, localChangeAt)
 	}
 }
 
