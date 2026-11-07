@@ -29,7 +29,7 @@ export REDIS_DB='0'
 export REDIS_AUTH=''                        # optional Redis password
 ```
 
-The service does an initial refresh before accepting requests. It exits if that refresh fails, preventing it from serving an empty or stale cache as if it were valid.
+The HTTP server starts immediately and the first device refresh runs in the background. If eWeLink is temporarily unavailable, the process keeps running and retries on the regular interval instead of entering CrashLoopBackOff. Readiness (`/health-check`) stays `503` until a snapshot is available and tolerates failed refreshes while the last snapshot is still recent; liveness (`/livez`) only reflects the process itself.
 
 ## HTTP API
 
@@ -37,7 +37,8 @@ All application responses are JSON.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health-check` | Refresh health; `200` after the last refresh succeeded, otherwise `503` |
+| `GET` | `/livez` | Process liveness; always `200` while the HTTP server is running |
+| `GET` | `/health-check` | Readiness; `200` while a recent device snapshot exists, otherwise `503` |
 | `GET` | `/metrics` | Prometheus/OpenMetrics metrics, including standard Go/process metrics |
 | `GET` | `/v1/devices` | Cached devices and snapshot metadata |
 | `POST` | `/v1/update` | Force a device-list refresh from eWeLink and return the new snapshot (bypasses the scheduled refresh interval) |
@@ -119,15 +120,17 @@ Invalid switch requests return `422 Unprocessable Entity`, for example when `sta
 }
 ```
 
-If the most recent refresh failed, `GET /health-check` returns `503 Service Unavailable`:
+`GET /health-check` returns `503 Service Unavailable` when no successful snapshot exists or the last successful refresh is older than three refresh intervals. A failed refresh alone does not make it unready while a recent snapshot is available; the failure is still reported in `error`:
 
 ```json
 {
-  "ok": false,
+  "ok": true,
   "refreshedAt": "2026-08-22T10:15:30Z",
   "error": "eWeLink request timed out"
 }
 ```
+
+Use `/health-check` for readiness and `/livez` for liveness/startup probes so that an eWeLink outage does not restart the process.
 
 ## Metrics
 
@@ -142,7 +145,7 @@ Devices without a scalar `params.switch` state are omitted from these device-spe
 
 The bridge uses the MCP `getBasicInformation` tool (`{"extraParams":{}}`) for refreshes and `controlSingleDevice` for changes. Control requests provide the cached `deviceid`, `name`, `params: {"switch": "on"|"off"}`, and `extraParams: {}`.
 
-The bridge does not retry a control request: a network failure after it has been sent leaves the final device state unknown. It only modifies local cache state after the MCP tool reports success.
+If the MCP server rejects a request because its session expired (`400`/`404` with an invalid-session response), the bridge initializes a new session and retries the request once. This is safe because the server rejected it before executing it. Other failures are not retried: a network failure after a control request has been sent leaves the final device state unknown. The bridge only modifies local cache state after the MCP tool reports success.
 
 ## Tests
 

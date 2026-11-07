@@ -49,14 +49,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	service := bridge.NewServiceWithCache(bridge.NewMCPClient(mcpURL, nil), cache, metrics, logger)
 
-	if err := service.RefreshIfStale(ctx, refreshInterval); err != nil {
-		log.Fatalf("initial device refresh failed: %v", err)
-	}
-	go service.RefreshLoop(ctx, refreshInterval)
-
+	// Serve HTTP first and refresh in the background. A transient eWeLink
+	// outage must not turn into CrashLoopBackOff; readiness stays false until
+	// a snapshot is available, while liveness remains independent of eWeLink.
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           bridge.NewHTTPHandler(service),
+		Handler:           bridge.NewHTTPHandlerWithOptions(service, bridge.HTTPOptions{MaxSnapshotAge: 3 * refreshInterval}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -64,6 +62,13 @@ func main() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
+	}()
+
+	go func() {
+		if err := service.RefreshIfStale(ctx, refreshInterval); err != nil {
+			logger.Error("initial eWeLink device refresh failed; will retry", "error", err)
+		}
+		service.RefreshLoop(ctx, refreshInterval)
 	}()
 
 	<-ctx.Done()

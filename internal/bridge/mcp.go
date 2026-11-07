@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +62,21 @@ func (c *MCPClient) ControlSwitch(ctx context.Context, device Device, state stri
 }
 
 func (c *MCPClient) callLocked(ctx context.Context, tool string, arguments map[string]any) (json.RawMessage, error) {
+	result, err := c.callOnceLocked(ctx, tool, arguments)
+	var invalid *invalidSessionError
+	if errors.As(err, &invalid) {
+		// The MCP server rejected the request before executing it, so retrying
+		// once with a fresh session is safe even for control operations.
+		c.sessionID = ""
+		if err := c.initializeLocked(ctx); err != nil {
+			return nil, err
+		}
+		return c.callOnceLocked(ctx, tool, arguments)
+	}
+	return result, err
+}
+
+func (c *MCPClient) callOnceLocked(ctx context.Context, tool string, arguments map[string]any) (json.RawMessage, error) {
 	if c.sessionID == "" {
 		if err := c.initializeLocked(ctx); err != nil {
 			return nil, err
@@ -136,7 +152,11 @@ func (c *MCPClient) request(ctx context.Context, sessionID, method string, param
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, response.Header.Get("Mcp-Session-Id"), fmt.Errorf("MCP %s returned HTTP %d: %s", method, response.StatusCode, strings.TrimSpace(string(message)))
+		body := strings.TrimSpace(string(message))
+		if sessionID != "" && invalidSessionResponse(response.StatusCode, body) {
+			return nil, "", &invalidSessionError{method: method, status: response.StatusCode, body: body}
+		}
+		return nil, response.Header.Get("Mcp-Session-Id"), fmt.Errorf("MCP %s returned HTTP %d: %s", method, response.StatusCode, body)
 	}
 	if method == "notifications/initialized" {
 		return nil, response.Header.Get("Mcp-Session-Id"), nil
@@ -149,35 +169,77 @@ func (c *MCPClient) request(ctx context.Context, sessionID, method string, param
 	return result, response.Header.Get("Mcp-Session-Id"), nil
 }
 
+type invalidSessionError struct {
+	method string
+	status int
+	body   string
+}
+
+func (e *invalidSessionError) Error() string {
+	return fmt.Sprintf("MCP %s session is no longer valid (HTTP %d): %s", e.method, e.status, e.body)
+}
+
+func invalidSessionResponse(status int, body string) bool {
+	if status == http.StatusNotFound {
+		return true
+	}
+	if status == http.StatusBadRequest {
+		return strings.Contains(strings.ToLower(body), "session")
+	}
+	return false
+}
+
 func decodeMCPResponse(body io.Reader) (json.RawMessage, error) {
-	reader := bufio.NewScanner(body)
+	payload, err := io.ReadAll(io.LimitReader(body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+
+	// Some MCP servers answer with plain JSON while others stream SSE.
+	if trimmed := strings.TrimSpace(string(payload)); strings.HasPrefix(trimmed, "{") {
+		return decodeMCPEnvelope([]byte(trimmed))
+	}
+
+	reader := bufio.NewScanner(bytes.NewReader(payload))
 	reader.Buffer(make([]byte, 4096), 4<<20)
 	for reader.Scan() {
 		line := reader.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		var envelope struct {
-			Result json.RawMessage `json:"result"`
-			Error  *struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &envelope); err != nil {
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		result, err := decodeMCPEnvelope([]byte(data))
+		if err != nil {
 			return nil, err
 		}
-		if envelope.Error != nil {
-			return nil, fmt.Errorf("RPC error %d: %s", envelope.Error.Code, envelope.Error.Message)
-		}
-		if envelope.Result != nil {
-			return envelope.Result, nil
+		if result != nil {
+			return result, nil
 		}
 	}
 	if err := reader.Err(); err != nil {
 		return nil, err
 	}
 	return nil, fmt.Errorf("response did not contain an MCP result")
+}
+
+func decodeMCPEnvelope(data []byte) (json.RawMessage, error) {
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Error != nil {
+		return nil, fmt.Errorf("RPC error %d: %s", envelope.Error.Code, envelope.Error.Message)
+	}
+	if envelope.Result != nil {
+		return envelope.Result, nil
+	}
+	return nil, nil
 }
 
 func decodeDevices(result json.RawMessage) ([]Device, error) {

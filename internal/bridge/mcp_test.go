@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -26,6 +27,16 @@ func TestDecodeDevicesWithEncodedParams(t *testing.T) {
 
 func TestDecodeMCPResponse(t *testing.T) {
 	result, err := decodeMCPResponse(strings.NewReader("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n"))
+	if err != nil {
+		t.Fatalf("decodeMCPResponse() error = %v", err)
+	}
+	if string(result) != `{"ok":true}` {
+		t.Fatalf("result = %s", result)
+	}
+}
+
+func TestDecodeMCPResponsePlainJSON(t *testing.T) {
+	result, err := decodeMCPResponse(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`))
 	if err != nil {
 		t.Fatalf("decodeMCPResponse() error = %v", err)
 	}
@@ -72,6 +83,83 @@ func TestMCPInitializationSendsNotificationWithoutID(t *testing.T) {
 	}
 	if _, hasID := notification["id"]; hasID {
 		t.Fatalf("initialized notification unexpectedly has id: %#v", notification)
+	}
+}
+
+func TestMCPReinitializesExpiredSession(t *testing.T) {
+	var initializes, notifications, calls int
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		status := http.StatusOK
+		headers := make(http.Header)
+		var body string
+		switch payload["method"] {
+		case "initialize":
+			initializes++
+			headers.Set("Mcp-Session-Id", fmt.Sprintf("session-%d", initializes))
+			body = fmt.Sprintf("data: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":\"2025-03-26\"}}\n\n", initializes)
+		case "notifications/initialized":
+			notifications++
+			status = http.StatusAccepted
+		case "tools/call":
+			calls++
+			if calls == 1 {
+				status = http.StatusBadRequest
+				body = `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}`
+				break
+			}
+			body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"devices\\\":[]}\"}]}}\n\n"
+		default:
+			t.Fatalf("unexpected method %q", payload["method"])
+		}
+		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+
+	client := NewMCPClient("https://mcp.invalid", &http.Client{Transport: transport})
+	if _, err := client.FetchDevices(context.Background()); err != nil {
+		t.Fatalf("FetchDevices() error = %v", err)
+	}
+	if initializes != 2 || notifications != 2 || calls != 2 {
+		t.Fatalf("initialize=%d notifications=%d calls=%d, want 2/2/2", initializes, notifications, calls)
+	}
+}
+
+func TestMCPDoesNotRetryServerErrors(t *testing.T) {
+	var initializes, calls int
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		status := http.StatusOK
+		headers := make(http.Header)
+		var body string
+		switch payload["method"] {
+		case "initialize":
+			initializes++
+			headers.Set("Mcp-Session-Id", "session")
+			body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\"}}\n\n"
+		case "notifications/initialized":
+			status = http.StatusAccepted
+		case "tools/call":
+			calls++
+			status = http.StatusInternalServerError
+			body = "upstream unavailable"
+		}
+		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+
+	client := NewMCPClient("https://mcp.invalid", &http.Client{Transport: transport})
+	if _, err := client.FetchDevices(context.Background()); err == nil {
+		t.Fatal("FetchDevices() error = nil, want server error")
+	}
+	if initializes != 1 || calls != 1 {
+		t.Fatalf("initialize=%d calls=%d, want 1/1 without retrying a 500", initializes, calls)
 	}
 }
 

@@ -4,21 +4,44 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+type HTTPOptions struct {
+	// MaxSnapshotAge is how old the last successful refresh may be before the
+	// readiness endpoint starts returning 503. A single failed refresh does
+	// not make the service unready while a recent snapshot is still available.
+	// Zero restores the strict "last refresh must have succeeded" behaviour.
+	MaxSnapshotAge time.Duration
+}
+
 func NewHTTPHandler(service *Service) http.Handler {
+	return NewHTTPHandlerWithOptions(service, HTTPOptions{})
+}
+
+func NewHTTPHandlerWithOptions(service *Service, options HTTPOptions) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
 	mux.HandleFunc("GET /health-check", func(w http.ResponseWriter, r *http.Request) {
 		snapshot, err := service.Snapshot(r.Context())
+		ready := err == nil && !snapshot.RefreshedAt.IsZero()
+		if ready && options.MaxSnapshotAge > 0 && time.Since(snapshot.RefreshedAt) > options.MaxSnapshotAge {
+			ready = false
+		}
+		if ready && options.MaxSnapshotAge == 0 && snapshot.RefreshError != "" {
+			ready = false
+		}
 		status := http.StatusOK
-		if err != nil || snapshot.RefreshedAt.IsZero() || snapshot.RefreshError != "" {
+		if !ready {
 			status = http.StatusServiceUnavailable
 		}
 		response := map[string]any{
-			"ok":          status == http.StatusOK,
+			"ok":          ready,
 			"refreshedAt": snapshot.RefreshedAt,
 			"error":       snapshot.RefreshError,
 		}
