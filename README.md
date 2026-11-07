@@ -14,6 +14,7 @@ Never put the authenticated MCP URL in source control. Pass it as an environment
 export EWELINK_MCP_URL='https://…'
 export LISTEN_ADDR=':8080'                 # optional; defaults to :8080
 export REFRESH_INTERVAL='1m'                # optional; defaults to 1m
+export MAX_SNAPSHOT_AGE='3m'                # optional; defaults to 3x refresh interval
 export CACHE_MODE='memory'                  # memory (default) or redis
 
 go run ./cmd/ewelink-api
@@ -120,7 +121,7 @@ Invalid switch requests return `422 Unprocessable Entity`, for example when `sta
 }
 ```
 
-`GET /health-check` returns `503 Service Unavailable` when no successful snapshot exists or the last successful refresh is older than three refresh intervals. A failed refresh alone does not make it unready while a recent snapshot is available; the failure is still reported in `error`:
+`GET /health-check` returns `503 Service Unavailable` when no successful snapshot exists or the last successful refresh is older than `MAX_SNAPSHOT_AGE` (default: three refresh intervals). A failed refresh alone does not make it unready while a recent snapshot is available; the failure is still reported in `error`:
 
 ```json
 {

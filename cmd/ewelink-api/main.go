@@ -27,6 +27,16 @@ func main() {
 	if err != nil || refreshInterval <= 0 {
 		log.Fatalf("REFRESH_INTERVAL must be a positive Go duration: %v", err)
 	}
+	// Readiness tolerates failed refreshes until the last successful snapshot
+	// becomes older than this. The default keeps the previous 3x behaviour;
+	// it can be raised independently to avoid readiness flapping.
+	maxSnapshotAge := 3 * refreshInterval
+	if value := os.Getenv("MAX_SNAPSHOT_AGE"); value != "" {
+		maxSnapshotAge, err = time.ParseDuration(value)
+		if err != nil || maxSnapshotAge <= 0 {
+			log.Fatalf("MAX_SNAPSHOT_AGE must be a positive Go duration: %v", err)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -54,7 +64,7 @@ func main() {
 	// a snapshot is available, while liveness remains independent of eWeLink.
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           bridge.NewHTTPHandlerWithOptions(service, bridge.HTTPOptions{MaxSnapshotAge: 3 * refreshInterval}),
+		Handler:           bridge.NewHTTPHandlerWithOptions(service, bridge.HTTPOptions{MaxSnapshotAge: maxSnapshotAge}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
