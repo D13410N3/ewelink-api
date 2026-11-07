@@ -56,6 +56,24 @@ func TestRefreshIfStaleUsesSharedFreshSnapshot(t *testing.T) {
 	}
 }
 
+func TestRefreshIfStaleAccountsForTickerJitter(t *testing.T) {
+	cache := NewMemoryCache()
+	// A snapshot refreshed 59s ago is effectively due for the next 1m tick;
+	// without the jitter tolerance the next ticker tick would skip it.
+	if err := cache.Replace(context.Background(), []Device{{ID: "existing"}}, time.Now().Add(-59*time.Second)); err != nil {
+		t.Fatalf("cache.Replace() error = %v", err)
+	}
+	remote := &fakeRemote{devices: []Device{{ID: "from-remote"}}}
+	service := NewServiceWithCache(remote, cache, noopMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := service.RefreshIfStale(context.Background(), time.Minute); err != nil {
+		t.Fatalf("RefreshIfStale() error = %v", err)
+	}
+	if remote.fetches != 1 {
+		t.Fatalf("remote fetches = %d, want 1 for a snapshot that is due by the ticker", remote.fetches)
+	}
+}
+
 func TestRefreshIfStaleRefreshesSharedStaleSnapshotOnce(t *testing.T) {
 	cache := NewMemoryCache()
 	if err := cache.Replace(context.Background(), []Device{{ID: "stale"}}, time.Now().Add(-time.Minute)); err != nil {

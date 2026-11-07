@@ -57,7 +57,7 @@ func (s *Service) RefreshIfStale(ctx context.Context, interval time.Duration) er
 	if err != nil {
 		return err
 	}
-	if snapshot.RefreshError == "" && !snapshot.RefreshedAt.IsZero() && time.Since(snapshot.RefreshedAt) < interval {
+	if snapshotFresh(snapshot, interval) {
 		s.metrics.RecordRefresh(snapshot.Devices)
 		return nil
 	}
@@ -77,11 +77,24 @@ func (s *Service) RefreshIfStale(ctx context.Context, interval time.Duration) er
 	if err != nil {
 		return err
 	}
-	if snapshot.RefreshError == "" && !snapshot.RefreshedAt.IsZero() && time.Since(snapshot.RefreshedAt) < interval {
+	if snapshotFresh(snapshot, interval) {
 		s.metrics.RecordRefresh(snapshot.Devices)
 		return nil
 	}
 	return s.Refresh(ctx)
+}
+
+// snapshotFresh reports whether the shared snapshot is recent enough to skip
+// a refresh. The timestamp is written when a refresh finishes, slightly after
+// the ticker that started it, so a naive comparison with interval would make
+// every second tick skip the refresh. A small tolerance compensates for that
+// scheduling jitter.
+func snapshotFresh(snapshot Snapshot, interval time.Duration) bool {
+	if snapshot.RefreshError != "" || snapshot.RefreshedAt.IsZero() {
+		return false
+	}
+	tolerance := interval / 10
+	return time.Since(snapshot.RefreshedAt) < interval-tolerance
 }
 
 func (s *Service) RefreshLoop(ctx context.Context, interval time.Duration) {
