@@ -171,3 +171,46 @@ func TestControlSucceeded(t *testing.T) {
 		t.Fatal("controlSucceeded() error = nil, want rejection")
 	}
 }
+
+func TestMCPControlChannelSendsSwitchesArray(t *testing.T) {
+	var arguments map[string]any
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		status := http.StatusOK
+		headers := make(http.Header)
+		var body string
+		switch payload["method"] {
+		case "initialize":
+			headers.Set("Mcp-Session-Id", "session")
+			body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\"}}\n\n"
+		case "notifications/initialized":
+			status = http.StatusAccepted
+		case "tools/call":
+			arguments = payload["params"].(map[string]any)["arguments"].(map[string]any)
+			body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"error\\\":0}\"}]}}\n\n"
+		default:
+			t.Fatalf("unexpected method %q", payload["method"])
+		}
+		return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+
+	client := NewMCPClient("https://mcp.invalid", &http.Client{Transport: transport})
+	if err := client.ControlChannel(context.Background(), Device{ID: "multi", Name: "Strip"}, 2, "on"); err != nil {
+		t.Fatalf("ControlChannel() error = %v", err)
+	}
+	params, ok := arguments["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params = %#v", arguments["params"])
+	}
+	switches, ok := params["switches"].([]any)
+	if !ok || len(switches) != 1 {
+		t.Fatalf("switches = %#v, want one outlet", params["switches"])
+	}
+	outlet, ok := switches[0].(map[string]any)
+	if !ok || outlet["outlet"] != float64(2) || outlet["switch"] != "on" {
+		t.Fatalf("outlet = %#v, want outlet 2 on", switches[0])
+	}
+}
