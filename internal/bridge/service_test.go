@@ -10,12 +10,13 @@ import (
 )
 
 type fakeRemote struct {
-	devices      []Device
-	fetchErr     error
-	controlErr   error
-	controlledID string
-	controlledTo string
-	fetches      int
+	devices           []Device
+	fetchErr          error
+	controlErr        error
+	controlledID      string
+	controlledTo      string
+	controlledChannel *int
+	fetches           int
 }
 
 func (f *fakeRemote) FetchDevices(context.Context) ([]Device, error) {
@@ -29,6 +30,14 @@ func (f *fakeRemote) FetchDevices(context.Context) ([]Device, error) {
 func (f *fakeRemote) ControlSwitch(_ context.Context, device Device, state string) error {
 	f.controlledID = device.ID
 	f.controlledTo = state
+	f.controlledChannel = nil
+	return f.controlErr
+}
+
+func (f *fakeRemote) ControlChannel(_ context.Context, device Device, channel int, state string) error {
+	f.controlledID = device.ID
+	f.controlledTo = state
+	f.controlledChannel = &channel
 	return f.controlErr
 }
 
@@ -134,7 +143,7 @@ func TestSwitchUpdatesCacheUntilAuthoritativeRefresh(t *testing.T) {
 		t.Fatalf("Refresh() error = %v", err)
 	}
 
-	device, err := service.Switch(context.Background(), "one", "")
+	device, err := service.Switch(context.Background(), "one", "", nil)
 	if err != nil {
 		t.Fatalf("Switch() error = %v", err)
 	}
@@ -184,7 +193,7 @@ func TestSwitchDoesNotChangeCacheWhenControlFails(t *testing.T) {
 		t.Fatalf("Refresh() error = %v", err)
 	}
 
-	if _, err := service.Switch(context.Background(), "one", "on"); err == nil {
+	if _, err := service.Switch(context.Background(), "one", "on", nil); err == nil {
 		t.Fatal("Switch() error = nil, want error")
 	}
 	device, _, err := service.Device(context.Background(), "one")
@@ -203,10 +212,66 @@ func TestSwitchRejectsUnsupportedDeviceState(t *testing.T) {
 		t.Fatalf("Refresh() error = %v", err)
 	}
 
-	if _, err := service.Switch(context.Background(), "multi", "on"); err == nil {
+	if _, err := service.Switch(context.Background(), "multi", "on", nil); err == nil {
 		t.Fatal("Switch() error = nil, want unsupported state error")
 	}
 	if remote.controlledID != "" {
 		t.Fatalf("control called for unsupported state: %q", remote.controlledID)
+	}
+}
+
+func TestSwitchChannelUpdatesOneOutlet(t *testing.T) {
+	remote := &fakeRemote{devices: []Device{{
+		ID:   "multi",
+		Name: "Strip",
+		Params: map[string]any{"switches": []any{
+			map[string]any{"outlet": float64(0), "switch": "off"},
+			map[string]any{"outlet": float64(1), "switch": "on"},
+		}},
+	}}}
+	service := newTestService(remote)
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+
+	channel := 1
+	device, err := service.Switch(context.Background(), "multi", "off", &channel)
+	if err != nil {
+		t.Fatalf("Switch() error = %v", err)
+	}
+	if remote.controlledChannel == nil || *remote.controlledChannel != channel {
+		t.Fatalf("controlled channel = %v, want %d", remote.controlledChannel, channel)
+	}
+	if remote.controlledTo != "off" {
+		t.Fatalf("controlled state = %q, want off", remote.controlledTo)
+	}
+	switches, ok := deviceSwitches(device)
+	if !ok || len(switches) != 2 {
+		t.Fatalf("switches after control = %#v, want two outlets", switches)
+	}
+	if switches[0].State != "off" || switches[1].State != "off" {
+		t.Fatalf("switches after control = %#v, want both off", switches)
+	}
+	if device.LastStateChangeAt == nil {
+		t.Fatal("channel control did not set lastStateChangeAt")
+	}
+}
+
+func TestSwitchChannelRejectsUnknownOutlet(t *testing.T) {
+	remote := &fakeRemote{devices: []Device{{
+		ID:     "multi",
+		Params: map[string]any{"switches": []any{map[string]any{"outlet": float64(0), "switch": "off"}}},
+	}}}
+	service := newTestService(remote)
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+
+	channel := 3
+	if _, err := service.Switch(context.Background(), "multi", "on", &channel); err == nil {
+		t.Fatal("Switch() error = nil, want unknown channel error")
+	}
+	if remote.controlledID != "" {
+		t.Fatalf("control called for unknown channel: %q", remote.controlledID)
 	}
 }

@@ -61,6 +61,27 @@ func (c *MCPClient) ControlSwitch(ctx context.Context, device Device, state stri
 	return controlSucceeded(result)
 }
 
+// ControlChannel controls one outlet of a multi-channel device. As with
+// ControlSwitch, it performs exactly one MCP call so an ambiguous transport
+// failure cannot execute the physical action twice.
+func (c *MCPClient) ControlChannel(ctx context.Context, device Device, channel int, state string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result, err := c.callLocked(ctx, "controlSingleDevice", map[string]any{
+		"deviceid": device.ID,
+		"name":     device.Name,
+		"params": map[string]any{
+			"switches": []map[string]any{{"outlet": channel, "switch": state}},
+		},
+		"extraParams": map[string]any{},
+	})
+	if err != nil {
+		return err
+	}
+	return controlSucceeded(result)
+}
+
 func (c *MCPClient) callLocked(ctx context.Context, tool string, arguments map[string]any) (json.RawMessage, error) {
 	result, err := c.callOnceLocked(ctx, tool, arguments)
 	var invalid *invalidSessionError

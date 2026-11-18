@@ -11,6 +11,7 @@ import (
 type Remote interface {
 	FetchDevices(context.Context) ([]Device, error)
 	ControlSwitch(context.Context, Device, string) error
+	ControlChannel(context.Context, Device, int, string) error
 }
 
 type Service struct {
@@ -119,13 +120,34 @@ func (s *Service) Device(ctx context.Context, id string) (Device, bool, error) {
 
 // Switch sends one control request and, only after its success, updates the
 // in-memory state. The local value lasts only until the following refresh.
-func (s *Service) Switch(ctx context.Context, id, state string) (Device, error) {
+// A nil channel controls the scalar params.switch; a non-nil channel controls
+// one outlet of params.switches.
+func (s *Service) Switch(ctx context.Context, id, state string, channel *int) (Device, error) {
 	device, ok, err := s.cache.Get(ctx, id)
 	if err != nil {
 		return Device{}, err
 	}
 	if !ok {
 		return Device{}, fmt.Errorf("device %q was not found", id)
+	}
+
+	if channel != nil {
+		state, err = requestedChannelState(device, *channel, state)
+		if err != nil {
+			return Device{}, err
+		}
+		if err := s.remote.ControlChannel(ctx, device, *channel, state); err != nil {
+			return Device{}, err
+		}
+		if err := s.cache.SetChannelSwitch(ctx, id, *channel, state, time.Now().UTC()); err != nil {
+			return Device{}, err
+		}
+		s.metrics.RecordChannelSwitch(device, *channel, state)
+		updated, _, err := s.cache.Get(ctx, id)
+		if err != nil {
+			return Device{}, err
+		}
+		return updated, nil
 	}
 
 	state, err = requestedState(device, state)
@@ -150,6 +172,9 @@ func requestedState(device Device, state string) (string, error) {
 	state = strings.ToLower(strings.TrimSpace(state))
 	switchValue, ok := device.Params["switch"].(string)
 	if !ok || (switchValue != "on" && switchValue != "off") {
+		if _, hasChannels := deviceSwitches(device); hasChannels {
+			return "", fmt.Errorf("device %q is multi-channel; pass channel", device.ID)
+		}
 		return "", fmt.Errorf("device %q does not expose a scalar params.switch state", device.ID)
 	}
 
@@ -158,6 +183,38 @@ func requestedState(device Device, state string) (string, error) {
 		return state, nil
 	case "":
 		if switchValue == "on" {
+			return "off", nil
+		}
+		return "on", nil
+	default:
+		return "", fmt.Errorf("unsupported state %q; use on or off, or omit state to toggle", state)
+	}
+}
+
+func requestedChannelState(device Device, channel int, state string) (string, error) {
+	state = strings.ToLower(strings.TrimSpace(state))
+	switches, ok := deviceSwitches(device)
+	if !ok {
+		return "", fmt.Errorf("device %q does not expose params.switches", device.ID)
+	}
+	current := ""
+	found := false
+	for _, item := range switches {
+		if item.Outlet == channel {
+			current = item.State
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("device %q has no channel %d", device.ID, channel)
+	}
+
+	switch state {
+	case "on", "off":
+		return state, nil
+	case "":
+		if current == "on" {
 			return "off", nil
 		}
 		return "on", nil

@@ -3,6 +3,7 @@ package bridge
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,7 +82,16 @@ func NewHTTPHandlerWithOptions(service *Service, options HTTPOptions) http.Handl
 			writeError(w, http.StatusBadRequest, "request body must be valid form data")
 			return
 		}
-		handleSwitch(w, r, service, r.PostForm.Get("state"))
+		var channel *int
+		if raw := strings.TrimSpace(r.PostForm.Get("channel")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				writeError(w, http.StatusBadRequest, "channel must be a non-negative integer")
+				return
+			}
+			channel = &parsed
+		}
+		handleSwitch(w, r, service, r.PostForm.Get("state"), channel)
 	})
 	return mux
 }
@@ -99,8 +109,8 @@ func handleForcedRefresh(w http.ResponseWriter, r *http.Request, service *Servic
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
-func handleSwitch(w http.ResponseWriter, r *http.Request, service *Service, state string) {
-	device, err := service.Switch(r.Context(), r.PathValue("id"), state)
+func handleSwitch(w http.ResponseWriter, r *http.Request, service *Service, state string, channel *int) {
+	device, err := service.Switch(r.Context(), r.PathValue("id"), state, channel)
 	if err != nil {
 		status := http.StatusUnprocessableEntity
 		if strings.Contains(err.Error(), "was not found") {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,7 @@ type Cache interface {
 	Snapshot(context.Context) (Snapshot, error)
 	Get(context.Context, string) (Device, bool, error)
 	SetSwitch(context.Context, string, string, time.Time) error
+	SetChannelSwitch(context.Context, string, int, string, time.Time) error
 	TryAcquireRefreshLease(context.Context, time.Duration) (bool, error)
 	Close() error
 }
@@ -99,6 +102,24 @@ func (c *memoryCache) SetSwitch(_ context.Context, id, state string, changedAt t
 			c.snapshot.Devices[i].Params = make(map[string]any)
 		}
 		c.snapshot.Devices[i].Params["switch"] = state
+		c.snapshot.Devices[i].LastStateChangeAt = timePointer(changedAt)
+		return nil
+	}
+	return fmt.Errorf("device %q is not in the cache", id)
+}
+
+// SetChannelSwitch applies a successful multi-channel control result locally.
+// The next Replace removes it in favor of the remote server's status.
+func (c *memoryCache) SetChannelSwitch(_ context.Context, id string, channel int, state string, changedAt time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.snapshot.Devices {
+		if c.snapshot.Devices[i].ID != id {
+			continue
+		}
+		if err := setChannelState(&c.snapshot.Devices[i], channel, state); err != nil {
+			return err
+		}
 		c.snapshot.Devices[i].LastStateChangeAt = timePointer(changedAt)
 		return nil
 	}
@@ -198,6 +219,22 @@ func (c *redisCache) SetSwitch(ctx context.Context, id, state string, changedAt 
 	})
 }
 
+func (c *redisCache) SetChannelSwitch(ctx context.Context, id string, channel int, state string, changedAt time.Time) error {
+	return c.mutate(ctx, func(snapshot *Snapshot) error {
+		for i := range snapshot.Devices {
+			if snapshot.Devices[i].ID != id {
+				continue
+			}
+			if err := setChannelState(&snapshot.Devices[i], channel, state); err != nil {
+				return err
+			}
+			snapshot.Devices[i].LastStateChangeAt = timePointer(changedAt)
+			return nil
+		}
+		return fmt.Errorf("device %q is not in the cache", id)
+	})
+}
+
 func (c *redisCache) TryAcquireRefreshLease(ctx context.Context, duration time.Duration) (bool, error) {
 	acquired, err := c.client.SetNX(ctx, redisRefreshLeaseKey, "1", duration).Result()
 	if err != nil {
@@ -273,7 +310,7 @@ func mergeDevices(previous, incoming []Device, refreshedAt time.Time) []Device {
 	merged := cloneDevices(incoming)
 	for i := range merged {
 		previousDevice, found := previousByID[merged[i].ID]
-		state, hasState := scalarSwitchState(merged[i])
+		signature, hasState := switchSignature(merged[i])
 		if !hasState {
 			if found && previousDevice.LastStateChangeAt != nil {
 				merged[i].LastStateChangeAt = timePointer(*previousDevice.LastStateChangeAt)
@@ -281,8 +318,8 @@ func mergeDevices(previous, incoming []Device, refreshedAt time.Time) []Device {
 			continue
 		}
 
-		previousState, previousHasState := scalarSwitchState(previousDevice)
-		if found && previousHasState && previousState == state && previousDevice.LastStateChangeAt != nil {
+		previousSignature, previousHasState := switchSignature(previousDevice)
+		if found && previousHasState && previousSignature == signature && previousDevice.LastStateChangeAt != nil {
 			merged[i].LastStateChangeAt = timePointer(*previousDevice.LastStateChangeAt)
 			continue
 		}
@@ -294,6 +331,124 @@ func mergeDevices(previous, incoming []Device, refreshedAt time.Time) []Device {
 func scalarSwitchState(device Device) (string, bool) {
 	state, ok := device.Params["switch"].(string)
 	return state, ok && (state == "on" || state == "off")
+}
+
+// switchSignature renders the controllable state of a device as one string so
+// mergeDevices can keep the previous change timestamp when nothing changed.
+func switchSignature(device Device) (string, bool) {
+	if state, ok := scalarSwitchState(device); ok {
+		return "switch=" + state, true
+	}
+	switches, ok := deviceSwitches(device)
+	if !ok {
+		return "", false
+	}
+	parts := make([]string, 0, len(switches))
+	for _, item := range switches {
+		parts = append(parts, fmt.Sprintf("%d=%s", item.Outlet, item.State))
+	}
+	return "switches=" + strings.Join(parts, ","), true
+}
+
+type channelSwitch struct {
+	Outlet int
+	State  string
+}
+
+// deviceSwitches reads the multi-channel params.switches array in the shape
+// eWeLink returns it: [{"outlet":0,"switch":"on"}, ...].
+func deviceSwitches(device Device) ([]channelSwitch, bool) {
+	raw, ok := device.Params["switches"]
+	if !ok {
+		return nil, false
+	}
+	switch values := raw.(type) {
+	case []any:
+		result := make([]channelSwitch, 0, len(values))
+		for _, value := range values {
+			entry, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			outlet, ok := intValue(entry["outlet"])
+			if !ok {
+				continue
+			}
+			state, ok := entry["switch"].(string)
+			if !ok || (state != "on" && state != "off") {
+				continue
+			}
+			result = append(result, channelSwitch{Outlet: outlet, State: state})
+		}
+		if len(result) == 0 {
+			return nil, false
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i].Outlet < result[j].Outlet })
+		return result, true
+	case []map[string]any:
+		result := make([]channelSwitch, 0, len(values))
+		for _, entry := range values {
+			outlet, ok := intValue(entry["outlet"])
+			if !ok {
+				continue
+			}
+			state, ok := entry["switch"].(string)
+			if !ok || (state != "on" && state != "off") {
+				continue
+			}
+			result = append(result, channelSwitch{Outlet: outlet, State: state})
+		}
+		if len(result) == 0 {
+			return nil, false
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i].Outlet < result[j].Outlet })
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func intValue(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		number, err := typed.Int64()
+		return int(number), err == nil
+	default:
+		return 0, false
+	}
+}
+
+// setChannelState updates one outlet in params.switches, preserving the
+// device's other channels and their order.
+func setChannelState(device *Device, channel int, state string) error {
+	if device.Params == nil {
+		device.Params = make(map[string]any)
+	}
+	switches, ok := deviceSwitches(*device)
+	if !ok {
+		return fmt.Errorf("device %q does not expose params.switches", device.ID)
+	}
+	found := false
+	encoded := make([]any, 0, len(switches))
+	for _, item := range switches {
+		next := item.State
+		if item.Outlet == channel {
+			next = state
+			found = true
+		}
+		encoded = append(encoded, map[string]any{"outlet": item.Outlet, "switch": next})
+	}
+	if !found {
+		return fmt.Errorf("device %q has no channel %d", device.ID, channel)
+	}
+	device.Params["switches"] = encoded
+	return nil
 }
 
 func timePointer(value time.Time) *time.Time {

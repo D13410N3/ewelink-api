@@ -83,3 +83,37 @@ func TestSwitchEndpointUsesOptionalFormState(t *testing.T) {
 		t.Fatalf("legacy route status = %d, want %d", legacyResponse.Code, http.StatusNotFound)
 	}
 }
+
+func TestSwitchEndpointControlsChannel(t *testing.T) {
+	remote := &fakeRemote{devices: []Device{{
+		ID: "multi",
+		Params: map[string]any{"switches": []any{
+			map[string]any{"outlet": float64(0), "switch": "off"},
+			map[string]any{"outlet": float64(1), "switch": "off"},
+		}},
+	}}}
+	service := newTestService(remote)
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	handler := NewHTTPHandler(service)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/devices/multi/switch", strings.NewReader("state=on&channel=1"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("channel switch status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if remote.controlledChannel == nil || *remote.controlledChannel != 1 || remote.controlledTo != "on" {
+		t.Fatalf("control = (channel %v, state %q), want (1, on)", remote.controlledChannel, remote.controlledTo)
+	}
+
+	bad := httptest.NewRequest(http.MethodPost, "/v1/devices/multi/switch", strings.NewReader("state=on&channel=x"))
+	bad.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	badResponse := httptest.NewRecorder()
+	handler.ServeHTTP(badResponse, bad)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid channel status = %d, want %d", badResponse.Code, http.StatusBadRequest)
+	}
+}

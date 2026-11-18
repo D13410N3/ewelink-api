@@ -22,7 +22,7 @@ func TestMetricsRecordDeviceStateAndSwitch(t *testing.T) {
 	if err := service.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh() error = %v", err)
 	}
-	if _, err := service.Switch(context.Background(), "one", "on"); err != nil {
+	if _, err := service.Switch(context.Background(), "one", "on", nil); err != nil {
 		t.Fatalf("Switch() error = %v", err)
 	}
 

@@ -45,11 +45,11 @@ All application responses are JSON.
 | `POST` | `/v1/update` | Force a device-list refresh from eWeLink and return the new snapshot (bypasses the scheduled refresh interval) |
 | `GET` | `/v1/devices/force` | Force a fresh device list from eWeLink, update cache, and return the new snapshot |
 | `GET` | `/v1/devices/{deviceID}` | A single cached device |
-| `POST` | `/v1/devices/{deviceID}/switch` | Set or toggle its primary `switch` parameter |
+| `POST` | `/v1/devices/{deviceID}/switch` | Set or toggle a scalar switch or one channel |
 
-`POST /switch` accepts optional URL-encoded form data. Send `state=on` or `state=off` to set the state; omit `state` to toggle the cached current state.
+`POST /switch` accepts optional URL-encoded form data. Send `state=on` or `state=off` to set the state; omit `state` to toggle the cached current state. Add a zero-based `channel=N` for a multi-channel device. Without `channel`, the device must expose a scalar `params.switch`; the bridge never guesses which outlet to control.
 
-A device must have a scalar `params.switch` value of `on` or `off`; multi-channel devices require a future channel-aware endpoint rather than guessing a channel.
+Multi-channel devices expose `params.switches` as `[{"outlet":0,"switch":"on"}, …]`. A successful channel command updates only that outlet locally until the next authoritative refresh.
 
 Example:
 
@@ -62,6 +62,8 @@ curl http://localhost:8080/v1/devices/force
 curl -X POST http://localhost:8080/v1/devices/1000abc/switch \
   -d 'state=on'
 curl -X POST http://localhost:8080/v1/devices/1000abc/switch
+curl -X POST http://localhost:8080/v1/devices/1000multi/switch \
+  -d 'state=on&channel=0'
 ```
 
 ### Response examples
@@ -96,7 +98,7 @@ A healthy `GET /health-check` returns `200 OK`:
 }
 ```
 
-`lastStateChangeAt` records the best-known time when the scalar switch state last changed. A successful service switch sets it immediately. On a later eWeLink refresh, it is retained while the reported state is unchanged; if eWeLink reports a different state (for example, after a physical/manual action), the refresh time becomes the new value. Rapid changes that begin and end between refreshes cannot be detected.
+`lastStateChangeAt` records the best-known time when the scalar switch or any outlet state last changed. A successful service switch sets it immediately. On a later eWeLink refresh, it is retained while the reported state is unchanged; if eWeLink reports a different state (for example, after a physical/manual action), the refresh time becomes the new value. Rapid changes that begin and end between refreshes cannot be detected.
 
 A successful `POST /v1/devices/1000abc/switch` with `state=on` returns `200 OK` and the temporarily updated cached device:
 
@@ -138,13 +140,15 @@ Use `/health-check` for readiness and `/livez` for liveness/startup probes so th
 The `/metrics` endpoint exposes the standard Prometheus Go and process metrics plus:
 
 - `ewelink_device_state{id, name, online, uiid}` — current primary switch state (`on=1`, `off=0`)
+- `ewelink_device_channel_state{id, name, online, uiid, channel}` — current state of each multi-channel outlet
 - `ewelink_device_switches_total{id, name, online, uiid}` — successful primary switch operations
+- `ewelink_device_channel_switches_total{id, name, online, uiid, channel}` — successful channel operations
 
-Devices without a scalar `params.switch` state are omitted from these device-specific metrics.
+Devices without a scalar `params.switch` state are omitted from the primary metrics but included in the channel metrics.
 
 ## MCP mapping
 
-The bridge uses the MCP `getBasicInformation` tool (`{"extraParams":{}}`) for refreshes and `controlSingleDevice` for changes. Control requests provide the cached `deviceid`, `name`, `params: {"switch": "on"|"off"}`, and `extraParams: {}`.
+The bridge uses the MCP `getBasicInformation` tool (`{"extraParams":{}}`) for refreshes and `controlSingleDevice` for changes. Control requests provide the cached `deviceid`, `name`, `params`, and `extraParams: {}`. Scalar devices send `params: {"switch": "on"|"off"}`; multi-channel devices send `params: {"switches":[{"outlet":N,"switch":"on"|"off"}]}`.
 
 If the MCP server rejects a request because its session expired (`400`/`404` with an invalid-session response), the bridge initializes a new session and retries the request once. This is safe because the server rejected it before executing it. Other failures are not retried: a network failure after a control request has been sent leaves the final device state unknown. The bridge only modifies local cache state after the MCP tool reports success.
 
