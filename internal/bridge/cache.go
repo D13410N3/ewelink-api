@@ -14,14 +14,14 @@ import (
 
 // Device is the device data the bridge needs to list and control a device.
 type Device struct {
-	ID                string         `json:"id"`
-	Name              string         `json:"name"`
-	Online            bool           `json:"online"`
-	UIID              string         `json:"uiid,omitempty"`
-	Params            map[string]any `json:"params"`
-	Family            any            `json:"family,omitempty"`
-	Channels          any            `json:"channels,omitempty"`
-	LastStateChangeAt *time.Time     `json:"lastStateChangeAt,omitempty"`
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	Online            bool              `json:"online"`
+	UIID              string            `json:"uiid,omitempty"`
+	Params            map[string]any    `json:"params"`
+	Family            any               `json:"family,omitempty"`
+	Channels          map[string]string `json:"channels,omitempty"`
+	LastStateChangeAt *time.Time        `json:"lastStateChangeAt,omitempty"`
 }
 
 type Snapshot struct {
@@ -479,6 +479,12 @@ func cloneDevice(device Device) Device {
 		clone.Params = make(map[string]any, len(device.Params))
 		for key, value := range device.Params {
 			clone.Params[key] = value
+		}
+	}
+	if device.Channels != nil {
+		clone.Channels = make(map[string]string, len(device.Channels))
+		for key, value := range device.Channels {
+			clone.Channels[key] = value
 		}
 	}
 	return clone

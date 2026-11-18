@@ -51,6 +51,18 @@ All application responses are JSON.
 
 Multi-channel devices expose `params.switches` as `[{"outlet":0,"switch":"on"}, …]`. A successful channel command updates only that outlet locally until the next authoritative refresh.
 
+Multi-channel devices also expose `channels`, the display label of every outlet from `params.switches`, keyed by zero-based outlet:
+
+```json
+"channels": {
+  "0": "Ванная",
+  "1": "Туалет",
+  "2": "Кухня"
+}
+```
+
+The label comes from eWeLink's `ck_channel_name` (the channel name edited in the official app). When eWeLink sends no usable label for an outlet, the bridge fills the gap itself with `Канал N`, where `N` is the one-based outlet number. `channels` is therefore always complete for a multi-channel device, and consumers should use it as-is instead of building channel names of their own. Scalar devices have no `channels` field.
+
 Example:
 
 ```sh

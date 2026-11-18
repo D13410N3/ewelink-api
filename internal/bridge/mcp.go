@@ -276,7 +276,7 @@ func decodeDevices(result json.RawMessage) ([]Device, error) {
 			UIID     json.RawMessage `json:"uiid"`
 			Params   json.RawMessage `json:"params"`
 			Family   any             `json:"family"`
-			Channels any             `json:"ck_channel_name"`
+			Channels json.RawMessage `json:"ck_channel_name"`
 		} `json:"devices"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
@@ -295,7 +295,9 @@ func decodeDevices(result json.RawMessage) ([]Device, error) {
 				uiid = strings.Trim(string(source.UIID), "\"")
 			}
 		}
-		devices = append(devices, Device{ID: source.ID, Name: source.Name, Online: source.Online, UIID: uiid, Params: params, Family: source.Family, Channels: source.Channels})
+		device := Device{ID: source.ID, Name: source.Name, Online: source.Online, UIID: uiid, Params: params, Family: source.Family}
+		applyChannelNames(&device, source.Channels)
+		devices = append(devices, device)
 	}
 	return devices, nil
 }
